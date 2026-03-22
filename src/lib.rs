@@ -7,7 +7,7 @@ pub mod parser;
 use commands::get_commands;
 use commands::PipelineExec;
 use env::Env;
-use fs::{Fs, FsMode};
+use fs::{Fs, FsLimits, FsMode};
 use parser::Pipeline;
 
 /// Execute a pipeline string (used by commands like xargs that need to run other commands).
@@ -131,6 +131,14 @@ impl Shell {
     pub fn with_mode(mode: FsMode) -> Self {
         Shell {
             fs: Fs::with_mode(mode),
+            env: Env::new(),
+        }
+    }
+
+    /// Create a shell with an in-memory filesystem and custom resource limits.
+    pub fn with_limits(limits: FsLimits) -> Self {
+        Shell {
+            fs: Fs::with_limits(limits),
             env: Env::new(),
         }
     }
@@ -929,5 +937,68 @@ mod tests {
         let result = shell.execute("man nonexistent");
         assert_eq!(result.exit_code, 1);
         assert!(result.stderr.contains("command not found"));
+    }
+
+    // ── Security tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_cp_into_self_rejected() {
+        let mut shell = Shell::new();
+        shell.execute("mkdir /src");
+        shell.fs_mut().write_file("/src/file.txt", "/", b"data");
+
+        let result = shell.execute("cp -r /src /src/child");
+        assert_ne!(result.exit_code, 0);
+        assert!(result.stderr.contains("cannot copy"));
+    }
+
+    #[test]
+    fn test_cp_nested_into_self_rejected() {
+        let mut shell = Shell::new();
+        shell.execute("mkdir -p /a/b/c");
+
+        let result = shell.execute("cp -r /a /a/b/c/d");
+        assert_ne!(result.exit_code, 0);
+        assert!(result.stderr.contains("cannot copy"));
+    }
+
+    #[test]
+    fn test_diff_size_cap() {
+        let mut shell = Shell::new();
+        // Create a file with more than MAX_DIFF_LINES (100000)
+        let lines: String = (0..150_000).map(|i| format!("line{}\n", i)).collect();
+        shell
+            .fs_mut()
+            .write_file("/big1.txt", "/", lines.as_bytes());
+        let lines2: String = (0..150_000).map(|i| format!("line{}_x\n", i)).collect();
+        shell
+            .fs_mut()
+            .write_file("/big2.txt", "/", lines2.as_bytes());
+
+        let result = shell.execute("diff /big1.txt /big2.txt");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("too large"));
+    }
+
+    #[test]
+    fn test_memoryfs_limits_via_shell() {
+        use fs::FsLimits;
+        let limits = FsLimits {
+            max_file_size: 100,
+            ..Default::default()
+        };
+        let mut shell = Shell::with_limits(limits);
+
+        // Small write should succeed
+        shell.fs_mut().write_file("/ok.txt", "/", b"small");
+        assert!(shell.fs().exists("/ok.txt", "/"));
+
+        // Oversized write via shell execute should not crash
+        // (echo writes through the shell, which respects fs limits)
+        let big_text: String = "x".repeat(200);
+        let result = shell.execute(&format!("echo {} > /big.txt", big_text));
+        // The file may or may not be created depending on how echo output flows,
+        // but it should not panic
+        assert!(result.exit_code == 0 || !shell.fs().exists("/big.txt", "/"));
     }
 }

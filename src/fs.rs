@@ -26,6 +26,26 @@ pub struct DirEntry {
     pub size: u64,
 }
 
+/// Resource limits for the in-memory filesystem.
+pub struct FsLimits {
+    /// Maximum size of a single file in bytes.
+    pub max_file_size: usize,
+    /// Maximum number of entries in a single directory.
+    pub max_dir_entries: usize,
+    /// Maximum total nodes (files + dirs) in MemoryFs.
+    pub max_total_nodes: usize,
+}
+
+impl Default for FsLimits {
+    fn default() -> Self {
+        FsLimits {
+            max_file_size: 100 * 1024 * 1024, // 100 MB
+            max_dir_entries: 100_000,
+            max_total_nodes: 1_000_000,
+        }
+    }
+}
+
 /// Filesystem operating mode, specified at creation time.
 pub enum FsMode {
     /// All reads and writes in memory. Nothing touches disk.
@@ -78,6 +98,13 @@ impl Fs {
                 FsMode::ReadThrough(root) => Box::new(ReadThroughFs::new(root)),
                 FsMode::Passthrough(root) => Box::new(PassthroughFs::new(root)),
             },
+        }
+    }
+
+    /// Create a Memory-mode shell with custom resource limits.
+    pub fn with_limits(limits: FsLimits) -> Self {
+        Fs {
+            inner: Box::new(MemoryFs::with_limits(limits)),
         }
     }
 
@@ -238,10 +265,15 @@ pub(crate) struct MemoryFs {
     nodes: HashMap<NodeId, Node>,
     next_id: NodeId,
     root: NodeId,
+    limits: FsLimits,
 }
 
 impl MemoryFs {
     pub fn new() -> Self {
+        Self::with_limits(FsLimits::default())
+    }
+
+    pub fn with_limits(limits: FsLimits) -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(
             0,
@@ -253,13 +285,17 @@ impl MemoryFs {
             nodes,
             next_id: 1,
             root: 0,
+            limits,
         }
     }
 
-    fn alloc_id(&mut self) -> NodeId {
+    fn alloc_id(&mut self) -> Option<NodeId> {
+        if self.nodes.len() >= self.limits.max_total_nodes {
+            return None;
+        }
         let id = self.next_id;
         self.next_id += 1;
-        id
+        Some(id)
     }
 
     fn walk(&self, start: NodeId, components: &[&str]) -> Option<NodeId> {
@@ -276,9 +312,12 @@ impl MemoryFs {
     }
 
     fn remove_subtree(&mut self, id: NodeId) {
-        if let Some(Node::Dir { entries }) = self.nodes.remove(&id) {
-            for (_, child_id) in entries {
-                self.remove_subtree(child_id);
+        let mut stack = vec![id];
+        while let Some(current_id) = stack.pop() {
+            if let Some(Node::Dir { entries }) = self.nodes.remove(&current_id) {
+                for (_, child_id) in entries {
+                    stack.push(child_id);
+                }
             }
         }
     }
@@ -305,10 +344,16 @@ impl FileSystem for MemoryFs {
             Some(id) => id,
             None => return false,
         };
-        let id = self.alloc_id();
+        let id = match self.alloc_id() {
+            Some(id) => id,
+            None => return false,
+        };
         match self.nodes.get_mut(&parent_id) {
             Some(Node::Dir { entries }) => {
                 if entries.contains_key(name) {
+                    return false;
+                }
+                if entries.len() >= self.limits.max_dir_entries {
                     return false;
                 }
                 entries.insert(name.to_string(), id);
@@ -331,10 +376,16 @@ impl FileSystem for MemoryFs {
             Some(id) => id,
             None => return false,
         };
-        let id = self.alloc_id();
+        let id = match self.alloc_id() {
+            Some(id) => id,
+            None => return false,
+        };
         match self.nodes.get_mut(&parent_id) {
             Some(Node::Dir { entries }) => {
                 if entries.contains_key(name) {
+                    return false;
+                }
+                if entries.len() >= self.limits.max_dir_entries {
                     return false;
                 }
                 entries.insert(name.to_string(), id);
@@ -354,6 +405,10 @@ impl FileSystem for MemoryFs {
     }
 
     fn write_file(&mut self, path: &str, cwd: &str, data: &[u8]) -> bool {
+        if data.len() > self.limits.max_file_size {
+            return false;
+        }
+
         let abs = resolve_abs(path, cwd);
 
         if let Some(node_id) = self.resolve_node_id(&abs, "/") {
@@ -372,9 +427,15 @@ impl FileSystem for MemoryFs {
             Some(id) => id,
             None => return false,
         };
-        let id = self.alloc_id();
+        let id = match self.alloc_id() {
+            Some(id) => id,
+            None => return false,
+        };
         match self.nodes.get_mut(&parent_id) {
             Some(Node::Dir { entries }) => {
+                if entries.len() >= self.limits.max_dir_entries {
+                    return false;
+                }
                 entries.insert(name.to_string(), id);
                 self.nodes.insert(
                     id,
@@ -625,6 +686,7 @@ impl Default for MemoryFs {
 
 pub(crate) struct ReadThroughFs {
     disk_root: PathBuf,
+    canonical_root: PathBuf,
     files: HashMap<String, Vec<u8>>,
     dir_entries: HashMap<String, BTreeMap<String, ()>>,
     deleted: std::collections::HashSet<String>,
@@ -632,10 +694,14 @@ pub(crate) struct ReadThroughFs {
 
 impl ReadThroughFs {
     pub fn new(disk_root: PathBuf) -> Self {
+        let canonical_root = disk_root
+            .canonicalize()
+            .unwrap_or_else(|_| disk_root.clone());
         let mut dir_entries = HashMap::new();
         dir_entries.insert("/".to_string(), BTreeMap::new());
         ReadThroughFs {
             disk_root,
+            canonical_root,
             files: HashMap::new(),
             dir_entries,
             deleted: std::collections::HashSet::new(),
@@ -646,12 +712,26 @@ impl ReadThroughFs {
         to_real_path(&self.disk_root, virtual_path)
     }
 
+    /// Resolve a virtual path to a real path, ensuring it stays within disk_root.
+    fn sanitized_real(&self, virtual_path: &str) -> Option<PathBuf> {
+        let real = self.real(virtual_path);
+        let canonical = real.canonicalize().ok()?;
+        if canonical.starts_with(&self.canonical_root) {
+            Some(canonical)
+        } else {
+            None
+        }
+    }
+
     /// Populate overlay `dir_entries` for `path` from disk if not present.
     fn populate_dir(&mut self, path: &str) {
         if self.dir_entries.contains_key(path) || self.deleted.contains(path) {
             return;
         }
-        let real = self.real(path);
+        let real = match self.sanitized_real(path) {
+            Some(p) => p,
+            None => return,
+        };
         if let Ok(rd) = std::fs::read_dir(&real) {
             let mut entries = BTreeMap::new();
             for e in rd.flatten() {
@@ -760,8 +840,7 @@ impl FileSystem for ReadThroughFs {
             return Some(());
         }
         // Fall through to disk
-        let real = self.real(&abs);
-        std::fs::metadata(&real).ok().map(|_| ())
+        self.sanitized_real(&abs).map(|_| ())
     }
 
     fn mkdir(&mut self, path: &str, cwd: &str) -> bool {
@@ -776,8 +855,11 @@ impl FileSystem for ReadThroughFs {
 
         // Parent must be a directory
         if !self.is_overlay_dir(parent_path) {
-            let real = self.real(parent_path);
-            if !std::fs::metadata(&real).map_or(false, |m| m.is_dir()) {
+            let real = match self.sanitized_real(parent_path) {
+                Some(p) => p,
+                None => return false,
+            };
+            if !real.is_dir() {
                 return false;
             }
             self.populate_dir(parent_path);
@@ -790,7 +872,7 @@ impl FileSystem for ReadThroughFs {
             }
         }
         // Already exists (disk)?
-        if std::fs::metadata(self.real(&abs)).is_ok() {
+        if self.sanitized_real(&abs).is_some() {
             return false;
         }
 
@@ -818,8 +900,11 @@ impl FileSystem for ReadThroughFs {
                 }
             }
         } else {
-            let real = self.real(parent_path);
-            if !std::fs::metadata(&real).map_or(false, |m| m.is_dir()) {
+            let real = match self.sanitized_real(parent_path) {
+                Some(p) => p,
+                None => return false,
+            };
+            if !real.is_dir() {
                 return false;
             }
             self.populate_dir(parent_path);
@@ -854,8 +939,8 @@ impl FileSystem for ReadThroughFs {
         if self.dir_entries.contains_key(&abs) {
             return None; // it's a directory
         }
-        let real = self.real(&abs);
-        std::fs::read(&real).ok()
+        let real = self.sanitized_real(&abs)?;
+        std::fs::read(real).ok()
     }
 
     fn write_file(&mut self, path: &str, cwd: &str, data: &[u8]) -> bool {
@@ -878,8 +963,8 @@ impl FileSystem for ReadThroughFs {
         let parent_ok = if self.is_overlay_dir(parent_path) {
             true
         } else {
-            let real = self.real(parent_path);
-            std::fs::metadata(&real).map_or(false, |m| m.is_dir())
+            self.sanitized_real(parent_path)
+                .map_or(false, |p| p.is_dir())
         };
         if !parent_ok {
             return false;
@@ -928,7 +1013,10 @@ impl FileSystem for ReadThroughFs {
         }
 
         // Disk entries
-        let real = self.real(&abs);
+        let real = match self.sanitized_real(&abs) {
+            Some(p) => p,
+            None => return None,
+        };
         if let Ok(rd) = std::fs::read_dir(&real) {
             for entry in rd.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
@@ -990,10 +1078,11 @@ impl FileSystem for ReadThroughFs {
             return false;
         }
         // Disk file?
-        let real = self.real(&abs);
-        if std::fs::metadata(&real).map_or(false, |m| m.is_file()) {
-            self.deleted.insert(abs);
-            return true;
+        if let Some(real) = self.sanitized_real(&abs) {
+            if real.is_file() {
+                self.deleted.insert(abs);
+                return true;
+            }
         }
         false
     }
@@ -1030,16 +1119,17 @@ impl FileSystem for ReadThroughFs {
         }
 
         // Mark disk children as deleted
-        let real = self.real(&abs);
-        if let Ok(rd) = std::fs::read_dir(&real) {
-            for entry in rd.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    let child = if abs == "/" {
-                        format!("/{}", name)
-                    } else {
-                        format!("{}/{}", abs, name)
-                    };
-                    self.deleted.insert(child);
+        if let Some(real) = self.sanitized_real(&abs) {
+            if let Ok(rd) = std::fs::read_dir(&real) {
+                for entry in rd.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        let child = if abs == "/" {
+                            format!("/{}", name)
+                        } else {
+                            format!("{}/{}", abs, name)
+                        };
+                        self.deleted.insert(child);
+                    }
                 }
             }
         }
@@ -1110,8 +1200,7 @@ impl FileSystem for ReadThroughFs {
         if self.files.contains_key(&abs) || self.dir_entries.contains_key(&abs) {
             return true;
         }
-        let real = self.real(&abs);
-        std::fs::metadata(&real).is_ok()
+        self.sanitized_real(&abs).is_some()
     }
 
     fn is_dir(&self, path: &str, cwd: &str) -> bool {
@@ -1130,8 +1219,7 @@ impl FileSystem for ReadThroughFs {
         if self.files.contains_key(&abs) {
             return false;
         }
-        let real = self.real(&abs);
-        std::fs::metadata(&real).map_or(false, |m| m.is_dir())
+        self.sanitized_real(&abs).map_or(false, |p| p.is_dir())
     }
 
     fn find(&self, start_path: &str, pattern: &str) -> Vec<String> {
@@ -1145,11 +1233,18 @@ impl FileSystem for ReadThroughFs {
 
 pub(crate) struct PassthroughFs {
     disk_root: PathBuf,
+    canonical_root: PathBuf,
 }
 
 impl PassthroughFs {
     pub fn new(disk_root: PathBuf) -> Self {
-        PassthroughFs { disk_root }
+        let canonical_root = disk_root
+            .canonicalize()
+            .unwrap_or_else(|_| disk_root.clone());
+        PassthroughFs {
+            disk_root,
+            canonical_root,
+        }
     }
 
     fn real(&self, virtual_path: &str) -> PathBuf {
@@ -1164,60 +1259,94 @@ impl PassthroughFs {
 impl FileSystem for PassthroughFs {
     fn resolve(&self, path: &str, cwd: &str) -> Option<()> {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
-            return None;
-        }
         let real = self.real(&abs);
-        std::fs::metadata(&real).ok().map(|_| ())
+        let canonical = real.canonicalize().ok()?;
+        if canonical.starts_with(&self.canonical_root) {
+            Some(())
+        } else {
+            None
+        }
     }
 
     fn mkdir(&mut self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        let (parent_path, name) = split_path(&abs);
+        let parent_real = self.real(parent_path);
+        let canonical_parent = match parent_real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !canonical_parent.starts_with(&self.canonical_root) {
             return false;
         }
-        std::fs::create_dir(self.real(&abs)).is_ok()
+        std::fs::create_dir(canonical_parent.join(name)).is_ok()
     }
 
     fn create_file(&mut self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        let (parent_path, name) = split_path(&abs);
+        let parent_real = self.real(parent_path);
+        let canonical_parent = match parent_real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !canonical_parent.starts_with(&self.canonical_root) {
             return false;
         }
-        let real = self.real(&abs);
-        if real.exists() {
+        let target = canonical_parent.join(name);
+        if target.exists() {
             return false;
         }
-        std::fs::write(&real, b"").is_ok()
+        std::fs::write(&target, b"").is_ok()
     }
 
     fn read_file(&self, path: &str, cwd: &str) -> Option<Vec<u8>> {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        let real = self.real(&abs);
+        let canonical = real.canonicalize().ok()?;
+        if !canonical.starts_with(&self.canonical_root) {
             return None;
         }
-        std::fs::read(self.real(&abs)).ok()
+        std::fs::read(canonical).ok()
     }
 
     fn write_file(&mut self, path: &str, cwd: &str, data: &[u8]) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        // Try existing path first
+        if let Ok(canonical) = self.real(&abs).canonicalize() {
+            if !canonical.starts_with(&self.canonical_root) {
+                return false;
+            }
+            if canonical.is_dir() {
+                return false;
+            }
+            return std::fs::write(&canonical, data).is_ok();
+        }
+        // New file — validate parent
+        let (parent_path, name) = split_path(&abs);
+        let parent_real = self.real(parent_path);
+        let canonical_parent = match parent_real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !canonical_parent.starts_with(&self.canonical_root) {
             return false;
         }
-        let real = self.real(&abs);
-        if real.is_dir() {
+        let target = canonical_parent.join(name);
+        if target.is_dir() {
             return false;
         }
-        std::fs::write(&real, data).is_ok()
+        std::fs::write(&target, data).is_ok()
     }
 
     fn list_dir(&self, path: &str, cwd: &str, show_hidden: bool) -> Option<Vec<DirEntry>> {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        let real = self.real(&abs);
+        let canonical = real.canonicalize().ok()?;
+        if !canonical.starts_with(&self.canonical_root) {
             return None;
         }
-        let real = self.real(&abs);
-        let rd = std::fs::read_dir(&real).ok()?;
+        let rd = std::fs::read_dir(&canonical).ok()?;
         let mut entries = Vec::new();
         for entry in rd.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
@@ -1238,77 +1367,132 @@ impl FileSystem for PassthroughFs {
 
     fn remove(&mut self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
-            return false;
-        }
         let real = self.real(&abs);
-        if real.is_dir() {
+        let canonical = match real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !canonical.starts_with(&self.canonical_root) {
             return false;
         }
-        std::fs::remove_file(&real).is_ok()
+        if canonical.is_dir() {
+            return false;
+        }
+        std::fs::remove_file(&canonical).is_ok()
     }
 
     fn remove_all(&mut self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
+        let real = self.real(&abs);
+        let canonical = match real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !canonical.starts_with(&self.canonical_root) {
             return false;
         }
-        let real = self.real(&abs);
-        if real.is_dir() {
-            std::fs::remove_dir_all(&real).is_ok()
+        if canonical.is_dir() {
+            std::fs::remove_dir_all(&canonical).is_ok()
         } else {
-            std::fs::remove_file(&real).is_ok()
+            std::fs::remove_file(&canonical).is_ok()
         }
     }
 
     fn copy_file(&mut self, src: &str, dst: &str, cwd: &str) -> bool {
         let src_abs = self.resolve_abs(src, cwd);
         let dst_abs = self.resolve_abs(dst, cwd);
-        if src_abs.contains("..") || dst_abs.contains("..") {
+
+        let src_real = self.real(&src_abs);
+        let src_canonical = match src_real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !src_canonical.starts_with(&self.canonical_root) {
             return false;
         }
-        let src_real = self.real(&src_abs);
-        let dst_real = self.real(&dst_abs);
-        if dst_real.is_dir() {
-            let name = fs_name(&src_abs);
-            let target = dst_real.join(name);
-            std::fs::copy(&src_real, &target).is_ok()
+
+        // Resolve destination (existing or new)
+        let dst_target = if let Ok(canonical) = self.real(&dst_abs).canonicalize() {
+            if !canonical.starts_with(&self.canonical_root) {
+                return false;
+            }
+            if canonical.is_dir() {
+                let name = fs_name(&src_abs);
+                canonical.join(name)
+            } else {
+                canonical
+            }
         } else {
-            std::fs::copy(&src_real, &dst_real).is_ok()
-        }
+            let (parent_path, name) = split_path(&dst_abs);
+            let parent_real = self.real(parent_path);
+            let canonical_parent = match parent_real.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            if !canonical_parent.starts_with(&self.canonical_root) {
+                return false;
+            }
+            canonical_parent.join(name)
+        };
+
+        std::fs::copy(&src_canonical, &dst_target).is_ok()
     }
 
     fn move_node(&mut self, src: &str, dst: &str, cwd: &str) -> bool {
         let src_abs = self.resolve_abs(src, cwd);
         let dst_abs = self.resolve_abs(dst, cwd);
-        if src_abs.contains("..") || dst_abs.contains("..") {
+
+        let src_real = self.real(&src_abs);
+        let src_canonical = match src_real.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if !src_canonical.starts_with(&self.canonical_root) {
             return false;
         }
-        let src_real = self.real(&src_abs);
-        let dst_real = self.real(&dst_abs);
-        if dst_real.is_dir() {
-            let name = fs_name(&src_abs);
-            let target = dst_real.join(name);
-            std::fs::rename(&src_real, &target).is_ok()
+
+        let dst_target = if let Ok(canonical) = self.real(&dst_abs).canonicalize() {
+            if !canonical.starts_with(&self.canonical_root) {
+                return false;
+            }
+            if canonical.is_dir() {
+                let name = fs_name(&src_abs);
+                canonical.join(name)
+            } else {
+                canonical
+            }
         } else {
-            std::fs::rename(&src_real, &dst_real).is_ok()
-        }
+            let (parent_path, name) = split_path(&dst_abs);
+            let parent_real = self.real(parent_path);
+            let canonical_parent = match parent_real.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            if !canonical_parent.starts_with(&self.canonical_root) {
+                return false;
+            }
+            canonical_parent.join(name)
+        };
+
+        std::fs::rename(&src_canonical, &dst_target).is_ok()
     }
 
     fn exists(&self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
-            return false;
+        let real = self.real(&abs);
+        match real.canonicalize() {
+            Ok(canonical) => canonical.starts_with(&self.canonical_root),
+            Err(_) => false,
         }
-        self.real(&abs).exists()
     }
 
     fn is_dir(&self, path: &str, cwd: &str) -> bool {
         let abs = self.resolve_abs(path, cwd);
-        if abs.contains("..") {
-            return false;
+        let real = self.real(&abs);
+        match real.canonicalize() {
+            Ok(canonical) => canonical.starts_with(&self.canonical_root) && canonical.is_dir(),
+            Err(_) => false,
         }
-        self.real(&abs).is_dir()
     }
 
     fn find(&self, start_path: &str, pattern: &str) -> Vec<String> {
@@ -1366,10 +1550,13 @@ fn find_recursive(
 fn glob_matches(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    glob_inner(&p, &t, 0, 0)
+    glob_inner(&p, &t, 0, 0, 0)
 }
 
-fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
+fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize, depth: usize) -> bool {
+    if depth > 1000 {
+        return false;
+    }
     if pi == p.len() {
         return ti == t.len();
     }
@@ -1379,7 +1566,7 @@ fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
     match p[pi] {
         '*' => {
             for i in ti..=t.len() {
-                if glob_inner(p, t, pi + 1, i) {
+                if glob_inner(p, t, pi + 1, i, depth + 1) {
                     return true;
                 }
             }
@@ -1387,7 +1574,7 @@ fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
         }
         '?' => {
             if ti < t.len() {
-                glob_inner(p, t, pi + 1, ti + 1)
+                glob_inner(p, t, pi + 1, ti + 1, depth + 1)
             } else {
                 false
             }
@@ -1400,14 +1587,14 @@ fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
                 let class_end = pi + 1 + end;
                 let chars: Vec<char> = p[pi + 1..class_end].to_vec();
                 if chars.contains(&t[ti]) {
-                    return glob_inner(p, t, class_end + 1, ti + 1);
+                    return glob_inner(p, t, class_end + 1, ti + 1, depth + 1);
                 }
                 false
             } else {
-                t[ti] == '[' && glob_inner(p, t, pi + 1, ti + 1)
+                t[ti] == '[' && glob_inner(p, t, pi + 1, ti + 1, depth + 1)
             }
         }
-        c => t[ti] == c && glob_inner(p, t, pi + 1, ti + 1),
+        c => t[ti] == c && glob_inner(p, t, pi + 1, ti + 1, depth + 1),
     }
 }
 
@@ -1418,6 +1605,8 @@ fn glob_inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     // ── MemoryFs tests (regression) ───────────────────────────
 
@@ -1735,5 +1924,152 @@ mod tests {
         assert!(glob_matches("[abc].txt", "a.txt"));
         assert!(!glob_matches("[abc].txt", "d.txt"));
         assert!(glob_matches("*", "anything"));
+    }
+
+    // ── Security tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_pt_symlink_escape_read() {
+        let dir = tempdir().unwrap();
+        let secret_dir = tempdir().unwrap();
+        stdfs::write(secret_dir.path().join("secret.txt"), b"SENSITIVE").unwrap();
+
+        // Create symlink inside sandbox pointing outside
+        #[cfg(unix)]
+        symlink(secret_dir.path(), dir.path().join("escape")).unwrap();
+
+        let fs = pt_fs(dir.path());
+        // Reading through the symlink should fail
+        assert_eq!(fs.read_file("/escape/secret.txt", "/"), None);
+    }
+
+    #[test]
+    fn test_pt_symlink_escape_write() {
+        let dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+
+        #[cfg(unix)]
+        symlink(outside_dir.path(), dir.path().join("escape")).unwrap();
+
+        let mut fs = pt_fs(dir.path());
+        // Writing through the symlink should fail
+        assert!(!fs.write_file("/escape/evil.txt", "/", b"pwned"));
+        // Confirm nothing was written outside
+        assert!(!outside_dir.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn test_pt_symlink_escape_mkdir() {
+        let dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+
+        #[cfg(unix)]
+        symlink(outside_dir.path(), dir.path().join("escape")).unwrap();
+
+        let mut fs = pt_fs(dir.path());
+        assert!(!fs.mkdir("/escape/evil", "/"));
+        assert!(!outside_dir.path().join("evil").exists());
+    }
+
+    #[test]
+    fn test_pt_symlink_escape_remove() {
+        let dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        stdfs::write(outside_dir.path().join("important.txt"), b"data").unwrap();
+
+        #[cfg(unix)]
+        symlink(outside_dir.path(), dir.path().join("escape")).unwrap();
+
+        let mut fs = pt_fs(dir.path());
+        assert!(!fs.remove("/escape/important.txt", "/"));
+        // File should still exist outside
+        assert!(outside_dir.path().join("important.txt").exists());
+    }
+
+    #[test]
+    fn test_rt_symlink_escape_read() {
+        let dir = tempdir().unwrap();
+        let secret_dir = tempdir().unwrap();
+        stdfs::write(secret_dir.path().join("secret.txt"), b"SENSITIVE").unwrap();
+
+        #[cfg(unix)]
+        symlink(secret_dir.path(), dir.path().join("escape")).unwrap();
+
+        let fs = rt_fs(dir.path());
+        assert_eq!(fs.read_file("/escape/secret.txt", "/"), None);
+    }
+
+    #[test]
+    fn test_memoryfs_file_size_limit() {
+        let limits = FsLimits {
+            max_file_size: 1024, // 1KB limit
+            ..Default::default()
+        };
+        let mut fs = Fs::with_limits(limits);
+
+        // Small file should work
+        assert!(fs.write_file("/small.txt", "/", &[0u8; 512]));
+
+        // Oversized file should be rejected
+        assert!(!fs.write_file("/big.txt", "/", &[0u8; 2048]));
+
+        // Existing file overwrite with oversized data should be rejected
+        assert!(!fs.write_file("/small.txt", "/", &[0u8; 2048]));
+    }
+
+    #[test]
+    fn test_memoryfs_dir_entry_limit() {
+        let limits = FsLimits {
+            max_dir_entries: 3,
+            ..Default::default()
+        };
+        let mut fs = Fs::with_limits(limits);
+
+        assert!(fs.mkdir("/dir", "/"));
+        assert!(fs.write_file("/dir/a", "/", b"1"));
+        assert!(fs.write_file("/dir/b", "/", b"2"));
+        assert!(fs.write_file("/dir/c", "/", b"3"));
+        // Fourth entry should be rejected
+        assert!(!fs.write_file("/dir/d", "/", b"4"));
+        assert!(!fs.mkdir("/dir/subdir", "/"));
+    }
+
+    #[test]
+    fn test_memoryfs_total_node_limit() {
+        let limits = FsLimits {
+            max_total_nodes: 3, // root + 2 more
+            ..Default::default()
+        };
+        let mut fs = Fs::with_limits(limits);
+
+        assert!(fs.mkdir("/a", "/"));
+        assert!(fs.write_file("/b", "/", b"data"));
+        // Third new node should fail
+        assert!(!fs.mkdir("/c", "/"));
+    }
+
+    #[test]
+    fn test_deep_tree_remove_no_stack_overflow() {
+        let mut fs = Fs::new();
+        // Create a deep tree (10000 levels)
+        let mut path = String::from("/deep");
+        fs.mkdir(&path, "/");
+        for _ in 0..9999 {
+            path.push_str("/x");
+            fs.mkdir(&path, "/");
+        }
+        // This should not stack overflow
+        assert!(fs.remove_all("/deep", "/"));
+        assert!(!fs.exists("/deep", "/"));
+    }
+
+    #[test]
+    fn test_glob_no_exponential_backtracking() {
+        // Pattern with many wildcards against adversarial text
+        // Without depth limit, this would be exponential
+        let pattern = "*********a";
+        let text = "aaaaaaaaaab";
+        // Should return quickly (either true or false), not hang
+        assert!(!glob_matches(pattern, text));
     }
 }

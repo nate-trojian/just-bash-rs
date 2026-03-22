@@ -1261,7 +1261,20 @@ fn cmd_cp(
                 1,
             );
         }
-        copy_dir(fs, src, dst, env.cwd());
+        // Prevent copying a directory into itself
+        let src_abs = fs.resolve_abs(src, env.cwd());
+        let dst_abs = fs.resolve_abs(dst, env.cwd());
+        if dst_abs.starts_with(&src_abs)
+            && (dst_abs.len() == src_abs.len()
+                || dst_abs.as_bytes().get(src_abs.len()) == Some(&b'/'))
+        {
+            return (
+                String::new(),
+                format!("cp: cannot copy '{}' into itself\n", src),
+                1,
+            );
+        }
+        copy_dir(fs, src, dst, env.cwd(), 0);
     } else {
         if !fs.copy_file(src, dst, env.cwd()) {
             return (
@@ -1275,7 +1288,10 @@ fn cmd_cp(
     (String::new(), String::new(), 0)
 }
 
-fn copy_dir(fs: &mut Fs, src: &str, dst: &str, cwd: &str) -> bool {
+fn copy_dir(fs: &mut Fs, src: &str, dst: &str, cwd: &str, depth: usize) -> bool {
+    if depth > 100 {
+        return false;
+    }
     // Create destination directory
     fs.mkdir(dst, cwd);
 
@@ -1293,7 +1309,7 @@ fn copy_dir(fs: &mut Fs, src: &str, dst: &str, cwd: &str) -> bool {
             };
 
             if entry.is_dir {
-                copy_dir(fs, &src_child, &dst_child, cwd);
+                copy_dir(fs, &src_child, &dst_child, cwd, depth + 1);
             } else {
                 fs.copy_file(&src_child, &dst_child, cwd);
             }
@@ -2349,6 +2365,11 @@ fn cmd_diff(
 
     let lines_a: Vec<&str> = text_a.lines().collect();
     let lines_b: Vec<&str> = text_b.lines().collect();
+
+    const MAX_DIFF_LINES: usize = 100_000;
+    if lines_a.len() > MAX_DIFF_LINES || lines_b.len() > MAX_DIFF_LINES {
+        return (String::new(), "diff: input too large\n".to_string(), 2);
+    }
 
     if lines_a == lines_b {
         return (String::new(), String::new(), 0);
