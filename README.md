@@ -1,6 +1,8 @@
 # just-bash-rs
 
-Inspired by [just-bash](https://github.com/vercel-labs/just-bash)
+Inspired by [just-bash](https://github.com/vercel-labs/just-bash).
+
+"Oh boy, another rewrite in Rust..." Yes I hear you, but I really just made this so I can play with it and [monty](https://github.com/pydantic/monty) together.
 
 An in-memory bash emulator written in Rust. Provides a `Shell` struct that can execute bash-like commands with an in-memory filesystem and environment. Useful for testing shell-like behavior without touching the real filesystem.
 Currently in early development; APIs may change.
@@ -15,10 +17,6 @@ This crate provides a library interface; there is no binary.
 - Single and double quoted strings, backslash escaping
 - Auto-generated help via `man` command
 - Extensible command system with declarative metadata
-
-## Requirements
-
-This library uses the Rust 2024 edition, which requires a nightly compiler.
 
 ## Usage
 
