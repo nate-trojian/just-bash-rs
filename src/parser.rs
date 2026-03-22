@@ -1,5 +1,26 @@
 use crate::env::Env;
 
+// ── Error type ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub message: String,
+}
+
+impl ParseError {
+    fn new(msg: &str) -> Self {
+        ParseError {
+            message: msg.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "syntax error: {}", self.message)
+    }
+}
+
 // ── AST types ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,13 +43,16 @@ pub struct Pipeline {
 
 /// Parse a full input line (possibly containing `;`-separated statements)
 /// into a list of pipelines, with variables expanded.
-pub fn parse(input: &str, env: &Env) -> Vec<Pipeline> {
+pub fn parse(input: &str, env: &Env) -> Result<Vec<Pipeline>, ParseError> {
     let statements = split_statements(input);
-    statements
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| parse_statement(&s, env))
-        .collect()
+    let mut pipelines = Vec::new();
+    for s in statements {
+        if s.trim().is_empty() {
+            continue;
+        }
+        pipelines.push(parse_statement(&s, env)?);
+    }
+    Ok(pipelines)
 }
 
 // ── Statement splitting ───────────────────────────────────────────
@@ -71,13 +95,13 @@ fn split_statements(input: &str) -> Vec<String> {
 
 // ── Statement → Pipeline ──────────────────────────────────────────
 
-fn parse_statement(input: &str, env: &Env) -> Pipeline {
+fn parse_statement(input: &str, env: &Env) -> Result<Pipeline, ParseError> {
     let parts = split_pipes(input);
     let mut commands = Vec::new();
 
     for part in &parts {
-        let expanded = expand_variables(part, env);
-        let tokens = tokenize(&expanded);
+        let expanded = expand_variables(part, env)?;
+        let tokens = tokenize(&expanded)?;
         let cmd = parse_simple_command(tokens);
         commands.push(cmd);
     }
@@ -102,7 +126,7 @@ fn parse_statement(input: &str, env: &Env) -> Pipeline {
         }
     }
 
-    pipeline
+    Ok(pipeline)
 }
 
 fn split_pipes(input: &str) -> Vec<String> {
@@ -146,7 +170,7 @@ fn split_pipes(input: &str) -> Vec<String> {
 
 // ── Tokenizer ─────────────────────────────────────────────────────
 
-fn tokenize(input: &str) -> Vec<String> {
+fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -174,6 +198,8 @@ fn tokenize(input: &str) -> Vec<String> {
                     i += 1;
                     if i < chars.len() {
                         current.push(chars[i]);
+                    } else {
+                        return Err(ParseError::new("unexpected EOF after '\\'"));
                     }
                 }
                 _ => current.push(ch),
@@ -212,6 +238,8 @@ fn tokenize(input: &str) -> Vec<String> {
                 i += 1;
                 if i < chars.len() {
                     current.push(chars[i]);
+                } else {
+                    return Err(ParseError::new("unexpected EOF after '\\'"));
                 }
             }
             _ => current.push(ch),
@@ -219,11 +247,18 @@ fn tokenize(input: &str) -> Vec<String> {
         i += 1;
     }
 
+    if in_single {
+        return Err(ParseError::new("unterminated single quote"));
+    }
+    if in_double {
+        return Err(ParseError::new("unterminated double quote"));
+    }
+
     if !current.is_empty() {
         tokens.push(current);
     }
 
-    tokens
+    Ok(tokens)
 }
 
 // ── SimpleCommand parser ──────────────────────────────────────────
@@ -271,7 +306,7 @@ fn parse_simple_command(tokens: Vec<String>) -> SimpleCommand {
 
 // ── Variable expansion ────────────────────────────────────────────
 
-fn expand_variables(input: &str, env: &Env) -> String {
+fn expand_variables(input: &str, env: &Env) -> Result<String, ParseError> {
     let mut result = String::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -299,11 +334,13 @@ fn expand_variables(input: &str, env: &Env) -> String {
                     i += 1;
                     if i < chars.len() {
                         result.push(chars[i]);
+                    } else {
+                        return Err(ParseError::new("unexpected EOF after '\\'"));
                     }
                 }
                 '$' => {
                     i += 1;
-                    i = expand_var_at(&chars, i, env, &mut result);
+                    i = expand_var_at(&chars, i, env, &mut result)?;
                     continue;
                 }
                 _ => result.push(ch),
@@ -320,24 +357,39 @@ fn expand_variables(input: &str, env: &Env) -> String {
                 i += 1;
                 if i < chars.len() {
                     result.push(chars[i]);
+                } else {
+                    return Err(ParseError::new("unexpected EOF after '\\'"));
                 }
             }
             '$' => {
                 i += 1;
-                i = expand_var_at(&chars, i, env, &mut result);
+                i = expand_var_at(&chars, i, env, &mut result)?;
                 continue;
             }
             _ => result.push(ch),
         }
         i += 1;
     }
-    result
+
+    if in_single {
+        return Err(ParseError::new("unterminated single quote"));
+    }
+    if in_double {
+        return Err(ParseError::new("unterminated double quote"));
+    }
+
+    Ok(result)
 }
 
-fn expand_var_at(chars: &[char], mut i: usize, env: &Env, result: &mut String) -> usize {
+fn expand_var_at(
+    chars: &[char],
+    mut i: usize,
+    env: &Env,
+    result: &mut String,
+) -> Result<usize, ParseError> {
     if i >= chars.len() {
         result.push('$');
-        return i;
+        return Ok(i);
     }
 
     if chars[i] == '{' {
@@ -348,9 +400,10 @@ fn expand_var_at(chars: &[char], mut i: usize, env: &Env, result: &mut String) -
             var_name.push(chars[i]);
             i += 1;
         }
-        if i < chars.len() {
-            i += 1; // skip }
+        if i >= chars.len() {
+            return Err(ParseError::new("unterminated ${"));
         }
+        i += 1; // skip }
         if let Some(val) = env.get(&var_name) {
             result.push_str(val);
         }
@@ -372,7 +425,7 @@ fn expand_var_at(chars: &[char], mut i: usize, env: &Env, result: &mut String) -
     } else {
         result.push('$');
     }
-    i
+    Ok(i)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -381,51 +434,59 @@ fn expand_var_at(chars: &[char], mut i: usize, env: &Env, result: &mut String) -
 mod tests {
     use super::*;
 
+    fn tok(input: &str) -> Vec<String> {
+        tokenize(input).unwrap()
+    }
+
+    fn expand(input: &str, env: &Env) -> String {
+        expand_variables(input, env).unwrap()
+    }
+
     #[test]
     fn test_tokenize_simple() {
-        assert_eq!(tokenize("hello world"), vec!["hello", "world"]);
+        assert_eq!(tok("hello world"), vec!["hello", "world"]);
     }
 
     #[test]
     fn test_tokenize_quotes() {
-        assert_eq!(tokenize("'hello world'"), vec!["hello world"]);
-        assert_eq!(tokenize("\"hello world\""), vec!["hello world"]);
-        assert_eq!(tokenize("echo 'hello world'"), vec!["echo", "hello world"]);
+        assert_eq!(tok("'hello world'"), vec!["hello world"]);
+        assert_eq!(tok("\"hello world\""), vec!["hello world"]);
+        assert_eq!(tok("echo 'hello world'"), vec!["echo", "hello world"]);
     }
 
     #[test]
     fn test_tokenize_escape() {
-        assert_eq!(tokenize(r"hello\ world"), vec!["hello world"]);
+        assert_eq!(tok(r"hello\ world"), vec!["hello world"]);
     }
 
     #[test]
     fn test_tokenize_redirect() {
         assert_eq!(
-            tokenize("echo hello > file.txt"),
+            tok("echo hello > file.txt"),
             vec!["echo", "hello", ">", "file.txt"]
         );
         assert_eq!(
-            tokenize("echo hello >> file.txt"),
+            tok("echo hello >> file.txt"),
             vec!["echo", "hello", ">>", "file.txt"]
         );
-        assert_eq!(tokenize("cat < file.txt"), vec!["cat", "<", "file.txt"]);
+        assert_eq!(tok("cat < file.txt"), vec!["cat", "<", "file.txt"]);
     }
 
     #[test]
     fn test_expand_variables() {
         let mut env = Env::new();
         env.set("FOO", "bar");
-        assert_eq!(expand_variables("$FOO", &env), "bar");
-        assert_eq!(expand_variables("${FOO}", &env), "bar");
-        assert_eq!(expand_variables("hello $FOO", &env), "hello bar");
-        assert_eq!(expand_variables("'$FOO'", &env), "$FOO"); // single quotes
-        assert_eq!(expand_variables("\"$FOO\"", &env), "bar"); // double quotes
+        assert_eq!(expand("$FOO", &env), "bar");
+        assert_eq!(expand("${FOO}", &env), "bar");
+        assert_eq!(expand("hello $FOO", &env), "hello bar");
+        assert_eq!(expand("'$FOO'", &env), "$FOO"); // single quotes
+        assert_eq!(expand("\"$FOO\"", &env), "bar"); // double quotes
     }
 
     #[test]
     fn test_parse_simple() {
         let env = Env::new();
-        let pipelines = parse("echo hello", &env);
+        let pipelines = parse("echo hello", &env).unwrap();
         assert_eq!(pipelines.len(), 1);
         assert_eq!(pipelines[0].commands[0].args, vec!["echo", "hello"]);
     }
@@ -433,7 +494,7 @@ mod tests {
     #[test]
     fn test_parse_pipe() {
         let env = Env::new();
-        let pipelines = parse("echo hello | grep h", &env);
+        let pipelines = parse("echo hello | grep h", &env).unwrap();
         assert_eq!(pipelines.len(), 1);
         assert_eq!(pipelines[0].commands.len(), 2);
         assert_eq!(pipelines[0].commands[0].args, vec!["echo", "hello"]);
@@ -443,7 +504,7 @@ mod tests {
     #[test]
     fn test_parse_redirect() {
         let env = Env::new();
-        let pipelines = parse("echo hello > output.txt", &env);
+        let pipelines = parse("echo hello > output.txt", &env).unwrap();
         assert_eq!(pipelines[0].output_redirect, Some("output.txt".to_string()));
         assert!(!pipelines[0].append);
     }
@@ -451,7 +512,7 @@ mod tests {
     #[test]
     fn test_parse_append() {
         let env = Env::new();
-        let pipelines = parse("echo hello >> output.txt", &env);
+        let pipelines = parse("echo hello >> output.txt", &env).unwrap();
         assert_eq!(pipelines[0].output_redirect, Some("output.txt".to_string()));
         assert!(pipelines[0].append);
     }
@@ -459,14 +520,14 @@ mod tests {
     #[test]
     fn test_parse_input_redirect() {
         let env = Env::new();
-        let pipelines = parse("cat < input.txt", &env);
+        let pipelines = parse("cat < input.txt", &env).unwrap();
         assert_eq!(pipelines[0].input_redirect, Some("input.txt".to_string()));
     }
 
     #[test]
     fn test_parse_semicolon() {
         let env = Env::new();
-        let pipelines = parse("echo hello; echo world", &env);
+        let pipelines = parse("echo hello; echo world", &env).unwrap();
         assert_eq!(pipelines.len(), 2);
         assert_eq!(pipelines[0].commands[0].args, vec!["echo", "hello"]);
         assert_eq!(pipelines[1].commands[0].args, vec!["echo", "world"]);
@@ -475,7 +536,7 @@ mod tests {
     #[test]
     fn test_parse_complex() {
         let env = Env::new();
-        let pipelines = parse("echo hello | grep h > /tmp/out; cat < /tmp/out", &env);
+        let pipelines = parse("echo hello | grep h > /tmp/out; cat < /tmp/out", &env).unwrap();
         assert_eq!(pipelines.len(), 2);
         assert_eq!(pipelines[0].commands.len(), 2);
         assert_eq!(pipelines[0].output_redirect, Some("/tmp/out".to_string()));
@@ -486,14 +547,70 @@ mod tests {
     fn test_expand_exit_status() {
         let mut env = Env::new();
         env.set("?", "1");
-        assert_eq!(expand_variables("$?", &env), "1");
+        assert_eq!(expand("$?", &env), "1");
     }
 
     #[test]
     fn test_tokenize_adjacent_redirect() {
-        assert_eq!(
-            tokenize("echo hello>file"),
-            vec!["echo", "hello", ">", "file"]
-        );
+        assert_eq!(tok("echo hello>file"), vec!["echo", "hello", ">", "file"]);
+    }
+
+    // ── Error cases ─────────────────────────────────────────────
+
+    #[test]
+    fn test_trailing_backslash_tokenize() {
+        let result = tokenize(r"hello\");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("EOF after"));
+    }
+
+    #[test]
+    fn test_trailing_backslash_expand() {
+        let env = Env::new();
+        let result = expand_variables(r"hello\", &env);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("EOF after"));
+    }
+
+    #[test]
+    fn test_unterminated_dollar_brace() {
+        let env = Env::new();
+        let result = expand_variables("${FOO", &env);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("unterminated ${"));
+    }
+
+    #[test]
+    fn test_unterminated_single_quote() {
+        let result = tokenize("'hello");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("unterminated single quote"));
+    }
+
+    #[test]
+    fn test_unterminated_double_quote() {
+        let result = tokenize("\"hello");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("unterminated double quote"));
+    }
+
+    #[test]
+    fn test_parse_trailing_backslash() {
+        let env = Env::new();
+        let result = parse(r"echo hello\", &env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_unterminated_var() {
+        let env = Env::new();
+        let result = parse("echo ${FOO", &env);
+        assert!(result.is_err());
     }
 }

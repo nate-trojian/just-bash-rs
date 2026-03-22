@@ -77,17 +77,41 @@ pub(crate) trait FileSystem {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// FsEvent – audit log
+// ══════════════════════════════════════════════════════════════════
+
+/// Record of a filesystem operation, for audit logging.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FsEvent {
+    Resolve { path: String },
+    Mkdir { path: String },
+    CreateFile { path: String },
+    ReadFile { path: String },
+    WriteFile { path: String, size: usize },
+    ListDir { path: String },
+    Remove { path: String },
+    RemoveAll { path: String },
+    CopyFile { src: String, dst: String },
+    MoveNode { src: String, dst: String },
+    Exists { path: String },
+    IsDir { path: String },
+    Find { path: String, pattern: String },
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Fs – public wrapper
 // ══════════════════════════════════════════════════════════════════
 
 pub struct Fs {
     inner: Box<dyn FileSystem>,
+    events: Vec<FsEvent>,
 }
 
 impl Fs {
     pub fn new() -> Self {
         Fs {
             inner: Box::new(MemoryFs::new()),
+            events: Vec::new(),
         }
     }
 
@@ -98,6 +122,7 @@ impl Fs {
                 FsMode::ReadThrough(root) => Box::new(ReadThroughFs::new(root)),
                 FsMode::Passthrough(root) => Box::new(PassthroughFs::new(root)),
             },
+            events: Vec::new(),
         }
     }
 
@@ -105,6 +130,7 @@ impl Fs {
     pub fn with_limits(limits: FsLimits) -> Self {
         Fs {
             inner: Box::new(MemoryFs::with_limits(limits)),
+            events: Vec::new(),
         }
     }
 
@@ -126,41 +152,85 @@ impl Fs {
         split_path(path)
     }
 
+    // ── Event audit log ──────────────────────────────────────────
+
+    /// Get a slice of recorded filesystem events.
+    pub fn events(&self) -> &[FsEvent] {
+        &self.events
+    }
+
+    /// Take ownership of the recorded events, clearing the log.
+    pub fn take_events(&mut self) -> Vec<FsEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Clear the event log.
+    pub fn clear_events(&mut self) {
+        self.events.clear();
+    }
+
     // ── Delegate all operations ───────────────────────────────
 
     pub fn mkdir(&mut self, path: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::Mkdir {
+            path: path.to_string(),
+        });
         self.inner.mkdir(path, cwd)
     }
 
     pub fn create_file(&mut self, path: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::CreateFile {
+            path: path.to_string(),
+        });
         self.inner.create_file(path, cwd)
     }
 
     pub fn read_file(&self, path: &str, cwd: &str) -> Option<Vec<u8>> {
+        // Can't push to &self, so we skip read_file events (callers can
+        // use the FileSystem trait directly for reads without logging).
         self.inner.read_file(path, cwd)
     }
 
     pub fn write_file(&mut self, path: &str, cwd: &str, data: &[u8]) -> bool {
+        self.events.push(FsEvent::WriteFile {
+            path: path.to_string(),
+            size: data.len(),
+        });
         self.inner.write_file(path, cwd, data)
     }
 
     pub fn list_dir(&self, path: &str, cwd: &str, show_hidden: bool) -> Option<Vec<DirEntry>> {
+        // Can't push to &self; see read_file note above.
         self.inner.list_dir(path, cwd, show_hidden)
     }
 
     pub fn remove(&mut self, path: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::Remove {
+            path: path.to_string(),
+        });
         self.inner.remove(path, cwd)
     }
 
     pub fn remove_all(&mut self, path: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::RemoveAll {
+            path: path.to_string(),
+        });
         self.inner.remove_all(path, cwd)
     }
 
     pub fn copy_file(&mut self, src: &str, dst: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::CopyFile {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        });
         self.inner.copy_file(src, dst, cwd)
     }
 
     pub fn move_node(&mut self, src: &str, dst: &str, cwd: &str) -> bool {
+        self.events.push(FsEvent::MoveNode {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        });
         self.inner.move_node(src, dst, cwd)
     }
 
@@ -759,14 +829,6 @@ impl ReadThroughFs {
 
             // Make sure parent has entries populated from disk
             self.populate_dir(&parent);
-
-            // If parent exists but doesn't list this child, the child
-            // might only exist on disk — re-populate to pick it up.
-            if let Some(entries) = self.dir_entries.get(&parent) {
-                if !entries.contains_key(comp) {
-                    self.populate_dir(&parent);
-                }
-            }
         }
     }
 

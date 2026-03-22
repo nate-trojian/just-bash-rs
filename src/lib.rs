@@ -10,10 +10,23 @@ use env::Env;
 use fs::{Fs, FsLimits, FsMode};
 use parser::Pipeline;
 
+/// Maximum input length accepted by the parser (1 MB).
+const MAX_INPUT_LENGTH: usize = 1_048_576;
+
 /// Execute a pipeline string (used by commands like xargs that need to run other commands).
 fn execute_string(input: &str, fs: &mut Fs, env: &mut Env) -> (String, String, i32) {
+    if input.len() > MAX_INPUT_LENGTH {
+        return (
+            String::new(),
+            "syntax error: input too long\n".to_string(),
+            2,
+        );
+    }
     let commands = get_commands();
-    let pipelines = parser::parse(input, env);
+    let pipelines = match parser::parse(input, env) {
+        Ok(p) => p,
+        Err(e) => return (String::new(), format!("{}\n", e), 2),
+    };
 
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -154,8 +167,24 @@ impl Shell {
                 exit_code: 0,
             };
         }
+        if input.len() > MAX_INPUT_LENGTH {
+            return ExecuteResult {
+                stdout: String::new(),
+                stderr: "syntax error: input too long\n".to_string(),
+                exit_code: 2,
+            };
+        }
 
-        let pipelines = parser::parse(input, &self.env);
+        let pipelines = match parser::parse(input, &self.env) {
+            Ok(p) => p,
+            Err(e) => {
+                return ExecuteResult {
+                    stdout: String::new(),
+                    stderr: format!("{}\n", e),
+                    exit_code: 2,
+                }
+            }
+        };
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -1000,5 +1029,86 @@ mod tests {
         // The file may or may not be created depending on how echo output flows,
         // but it should not panic
         assert!(result.exit_code == 0 || !shell.fs().exists("/big.txt", "/"));
+    }
+
+    #[test]
+    fn test_parse_trailing_backslash_errors() {
+        let mut shell = Shell::new();
+        let result = shell.execute(r"echo hello\");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("syntax error"));
+    }
+
+    #[test]
+    fn test_parse_unterminated_var_errors() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo ${FOO");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("unterminated ${"));
+    }
+
+    #[test]
+    fn test_parse_unterminated_quote_errors() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo 'hello");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("unterminated single quote"));
+    }
+
+    #[test]
+    fn test_input_too_long() {
+        let mut shell = Shell::new();
+        let long_input = "x".repeat(2_000_000);
+        let result = shell.execute(&long_input);
+        assert_eq!(result.exit_code, 2);
+        assert!(result.stderr.contains("too long"));
+    }
+
+    #[test]
+    fn test_fs_events_accumulate() {
+        use fs::FsEvent;
+        let mut shell = Shell::new();
+        shell.execute("mkdir /tmp");
+        shell.execute("echo hello > /tmp/file.txt");
+        shell.execute("cat /tmp/file.txt");
+        shell.execute("rm /tmp/file.txt");
+
+        let events = shell.fs().events();
+        assert!(events.contains(&FsEvent::Mkdir {
+            path: "/tmp".to_string()
+        }));
+        assert!(events.contains(&FsEvent::WriteFile {
+            path: "/tmp/file.txt".to_string(),
+            size: 6
+        }));
+        assert!(events.contains(&FsEvent::Remove {
+            path: "/tmp/file.txt".to_string()
+        }));
+    }
+
+    #[test]
+    fn test_fs_events_take_clears() {
+        let mut shell = Shell::new();
+        shell.execute("mkdir /test");
+        assert!(!shell.fs().events().is_empty());
+
+        let events = shell.fs_mut().take_events();
+        assert!(!events.is_empty());
+        assert!(shell.fs().events().is_empty());
+    }
+
+    #[test]
+    fn test_fs_events_on_remove_all() {
+        use fs::FsEvent;
+        let mut shell = Shell::new();
+        shell.execute("mkdir -p /a/b");
+        shell.execute("touch /a/b/file.txt");
+        shell.fs_mut().clear_events();
+        shell.execute("rm -r /a");
+
+        let events = shell.fs().events();
+        assert!(events.contains(&FsEvent::RemoveAll {
+            path: "/a".to_string()
+        }));
     }
 }
