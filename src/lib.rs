@@ -1,12 +1,109 @@
+pub mod argparse;
 pub mod commands;
 pub mod env;
 pub mod fs;
 pub mod parser;
 
 use commands::get_commands;
+use commands::PipelineExec;
 use env::Env;
 use fs::{Fs, FsMode};
 use parser::Pipeline;
+
+/// Execute a pipeline string (used by commands like xargs that need to run other commands).
+fn execute_string(input: &str, fs: &mut Fs, env: &mut Env) -> (String, String, i32) {
+    let commands = get_commands();
+    let pipelines = parser::parse(input, env);
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = 0;
+
+    for pipeline in pipelines {
+        let (out, err, code) = run_pipeline(&pipeline, fs, env, &commands);
+        stdout.push_str(&out);
+        stderr.push_str(&err);
+        exit_code = code;
+    }
+
+    env.set("?", &exit_code.to_string());
+    (stdout, stderr, exit_code)
+}
+
+fn run_pipeline(
+    pipeline: &Pipeline,
+    fs: &mut Fs,
+    env: &mut Env,
+    commands: &std::collections::HashMap<
+        &'static str,
+        (commands::CommandFn, &'static commands::CommandMeta),
+    >,
+) -> (String, String, i32) {
+    let mut current_stdin = if let Some(ref input_file) = pipeline.input_redirect {
+        match fs.read_file(input_file, env.cwd()) {
+            Some(content) => String::from_utf8_lossy(&content).to_string(),
+            None => {
+                return (
+                    String::new(),
+                    format!("{}: No such file or directory\n", input_file),
+                    1,
+                );
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let mut final_stdout = String::new();
+    let mut final_stderr = String::new();
+    let mut exit_code = 0;
+
+    let exec: &PipelineExec =
+        &|input: &str, fs: &mut Fs, env: &mut Env| execute_string(input, fs, env);
+
+    for (i, cmd) in pipeline.commands.iter().enumerate() {
+        if cmd.args.is_empty() {
+            continue;
+        }
+
+        let name = &cmd.args[0];
+        let args = &cmd.args[1..];
+
+        if let Some((handler, _meta)) = commands.get(name.as_str()) {
+            let (stdout, stderr, code) = handler(args, &current_stdin, fs, env, exec);
+            exit_code = code;
+            final_stderr = stderr;
+
+            if i == pipeline.commands.len() - 1 {
+                final_stdout = stdout;
+            } else {
+                current_stdin = stdout;
+            }
+        } else {
+            final_stderr = format!("{}: command not found\n", name);
+            exit_code = 127;
+            break;
+        }
+    }
+
+    // Handle output redirect
+    if let Some(ref output_file) = pipeline.output_redirect {
+        if pipeline.append {
+            if let Some(existing) = fs.read_file(output_file, env.cwd()) {
+                let mut data = existing;
+                data.extend_from_slice(final_stdout.as_bytes());
+                fs.write_file(output_file, env.cwd(), &data);
+            } else {
+                fs.write_file(output_file, env.cwd(), final_stdout.as_bytes());
+            }
+        } else {
+            fs.write_file(output_file, env.cwd(), final_stdout.as_bytes());
+        }
+        final_stdout.clear();
+    }
+
+    (final_stdout, final_stderr, exit_code)
+}
 
 /// Result of executing a shell command.
 pub struct ExecuteResult {
@@ -75,75 +172,11 @@ impl Shell {
 
     fn execute_pipeline(&mut self, pipeline: &Pipeline) -> ExecuteResult {
         let commands = get_commands();
-
-        // Read input from file if `<` redirect
-        let mut current_stdin = if let Some(ref input_file) = pipeline.input_redirect {
-            match self.fs.read_file(input_file, self.env.cwd()) {
-                Some(content) => String::from_utf8_lossy(&content).to_string(),
-                None => {
-                    return ExecuteResult {
-                        stdout: String::new(),
-                        stderr: format!("{}: No such file or directory\n", input_file),
-                        exit_code: 1,
-                    };
-                }
-            }
-        } else {
-            String::new()
-        };
-
-        let mut final_stdout = String::new();
-        let mut final_stderr = String::new();
-        let mut exit_code = 0;
-
-        for (i, cmd) in pipeline.commands.iter().enumerate() {
-            if cmd.args.is_empty() {
-                continue;
-            }
-
-            let name = &cmd.args[0];
-            let args = &cmd.args[1..];
-
-            if let Some(handler) = commands.get(name.as_str()) {
-                let (stdout, stderr, code) =
-                    handler(args, &current_stdin, &mut self.fs, &mut self.env);
-                exit_code = code;
-                final_stderr = stderr;
-
-                if i == pipeline.commands.len() - 1 {
-                    final_stdout = stdout;
-                } else {
-                    current_stdin = stdout;
-                }
-            } else {
-                final_stderr = format!("{}: command not found\n", name);
-                exit_code = 127;
-                break;
-            }
-        }
-
-        // Apply output redirect
-        if let Some(ref output_file) = pipeline.output_redirect {
-            if pipeline.append {
-                if let Some(existing) = self.fs.read_file(output_file, self.env.cwd()) {
-                    let mut combined = String::from_utf8_lossy(&existing).to_string();
-                    combined.push_str(&final_stdout);
-                    self.fs
-                        .write_file(output_file, self.env.cwd(), combined.as_bytes());
-                } else {
-                    self.fs
-                        .write_file(output_file, self.env.cwd(), final_stdout.as_bytes());
-                }
-            } else {
-                self.fs
-                    .write_file(output_file, self.env.cwd(), final_stdout.as_bytes());
-            }
-            final_stdout = String::new();
-        }
-
+        let (stdout, stderr, exit_code) =
+            run_pipeline(pipeline, &mut self.fs, &mut self.env, &commands);
         ExecuteResult {
-            stdout: final_stdout,
-            stderr: final_stderr,
+            stdout,
+            stderr,
             exit_code,
         }
     }
@@ -577,5 +610,324 @@ mod tests {
         shell.execute("mkdir -p /home/user");
         shell.execute("cd");
         assert_eq!(shell.cwd(), "/home/user");
+    }
+
+    #[test]
+    fn test_uniq_basic() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"a\na\nb\nc\nc\nc\n");
+        let result = shell.execute("uniq /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_uniq_count() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"a\na\nb\nc\nc\nc\n");
+        let result = shell.execute("uniq -c /f.txt");
+        assert!(result.stdout.contains("2 a"));
+        assert!(result.stdout.contains("1 b"));
+        assert!(result.stdout.contains("3 c"));
+    }
+
+    #[test]
+    fn test_uniq_duplicates() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"a\na\nb\nc\nc\nc\n");
+        let result = shell.execute("uniq -d /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn test_uniq_unique_only() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"a\na\nb\nc\nc\nc\n");
+        let result = shell.execute("uniq -u /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["b"]);
+    }
+
+    #[test]
+    fn test_cut_fields() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"one\ttwo\tthree\nfour\tfive\tsix\n");
+        let result = shell.execute("cut -f 1,3 /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["one\tthree", "four\tsix"]);
+    }
+
+    #[test]
+    fn test_cut_custom_delimiter() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/f.txt", "/", b"a:b:c\n1:2:3\n");
+        let result = shell.execute("cut -d : -f 2 /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["b", "2"]);
+    }
+
+    #[test]
+    fn test_tr_translate() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello | tr 'a-z' 'A-Z'");
+        assert_eq!(result.stdout.trim(), "HELLO");
+    }
+
+    #[test]
+    fn test_tr_delete() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello | tr -d 'l'");
+        assert_eq!(result.stdout.trim(), "heo");
+    }
+
+    #[test]
+    fn test_tr_squeeze() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo aaabbbccc | tr -s 'a'");
+        assert_eq!(result.stdout.trim(), "abbbccc");
+    }
+
+    #[test]
+    fn test_tr_complement() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello123 | tr -c '[:alpha:]' '_'");
+        // -c complements: everything NOT alpha becomes '_'
+        // 'hello123\n' → 'hello' (5 alpha) + 4 non-alpha ('1','2','3','\n') → '_'
+        assert_eq!(result.stdout.trim(), "hello____");
+    }
+
+    #[test]
+    fn test_tr_delete_and_squeeze() {
+        let mut shell = Shell::new();
+        // -ds: delete chars in set, squeeze remaining
+        // set is 'ab', input is 'aaabbbccc'
+        // delete a,b → 'ccc', no repeats to squeeze
+        // but squeeze also applies to chars NOT in set for repeat removal
+        // Actually in real tr, -ds squeezes chars in set1 after deletion
+        // Since set1 chars are deleted, squeeze has no effect. Result: 'ccc'
+        // But our impl squeezes all repeated chars after deletion.
+        // Let's test with input that has repeated non-set chars
+        let result = shell.execute("echo aaabbbccc | tr -ds 'ab' 'x'");
+        // After deleting a and b from 'aaabbbccc': 'ccc'
+        // No consecutive repeats of set1 chars remain, so result is 'ccc'
+        assert_eq!(result.stdout.trim(), "ccc");
+    }
+
+    #[test]
+    fn test_tr_posix_upper() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello | tr '[:lower:]' '[:upper:]'");
+        assert_eq!(result.stdout.trim(), "HELLO");
+    }
+
+    #[test]
+    fn test_sed_substitute() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello world | sed 's/world/rust/'");
+        assert_eq!(result.stdout.trim(), "hello rust");
+    }
+
+    #[test]
+    fn test_sed_global() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo aaa | sed 's/a/b/g'");
+        assert_eq!(result.stdout.trim(), "bbb");
+    }
+
+    #[test]
+    fn test_sed_case_insensitive() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo Hello | sed 's/hello/hi/gi'");
+        assert_eq!(result.stdout.trim(), "hi");
+    }
+
+    #[test]
+    fn test_sed_first_only() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo aaa | sed 's/a/b/'");
+        assert_eq!(result.stdout.trim(), "baa");
+    }
+
+    #[test]
+    fn test_sed_delete_line() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"keep\nremove\nkeep\n");
+        let result = shell.execute("sed '2d' /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["keep", "keep"]);
+    }
+
+    #[test]
+    fn test_sed_print_line() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/f.txt", "/", b"a\nb\nc\n");
+        let result = shell.execute("sed -n '2p' /f.txt");
+        assert_eq!(result.stdout.trim(), "b");
+    }
+
+    #[test]
+    fn test_sed_delete_by_pattern() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"keep\nREMOVE\nkeep\n");
+        let result = shell.execute("sed '/REMOVE/d' /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["keep", "keep"]);
+    }
+
+    #[test]
+    fn test_sed_address_range() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/f.txt", "/", b"1\n2\n3\n4\n5\n");
+        let result = shell.execute("sed '2,4d' /f.txt");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["1", "5"]);
+    }
+
+    #[test]
+    fn test_sed_multiple_commands() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo 'hello world' | sed -e 's/hello/hi/' -e 's/world/there/'");
+        assert_eq!(result.stdout.trim(), "hi there");
+    }
+
+    #[test]
+    fn test_sed_semicolon_commands() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo 'hello world' | sed 's/hello/hi/;s/world/there/'");
+        assert_eq!(result.stdout.trim(), "hi there");
+    }
+
+    #[test]
+    fn test_basename_basic() {
+        let mut shell = Shell::new();
+        let result = shell.execute("basename /usr/local/bin/foo");
+        assert_eq!(result.stdout.trim(), "foo");
+    }
+
+    #[test]
+    fn test_basename_suffix() {
+        let mut shell = Shell::new();
+        let result = shell.execute("basename /path/to/file.tar.gz .gz");
+        assert_eq!(result.stdout.trim(), "file.tar");
+    }
+
+    #[test]
+    fn test_tee_basic() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo hello | tee /out.txt");
+        assert_eq!(result.stdout.trim(), "hello");
+        assert_eq!(
+            shell.fs().read_file("/out.txt", "/"),
+            Some(b"hello\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_tee_append() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/out.txt", "/", b"line1\n");
+        shell.execute("echo line2 | tee -a /out.txt");
+        let content = shell.fs().read_file("/out.txt", "/").unwrap();
+        assert_eq!(String::from_utf8_lossy(&content), "line1\nline2\n");
+    }
+
+    #[test]
+    fn test_xargs_basic() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo 'a b c' | xargs");
+        assert_eq!(result.stdout.trim(), "a b c");
+    }
+
+    #[test]
+    fn test_xargs_max_args() {
+        let mut shell = Shell::new();
+        let result = shell.execute("echo 'a b c d' | xargs -n 2");
+        let lines: Vec<&str> = result.stdout.trim().lines().collect();
+        assert_eq!(lines, vec!["a b", "c d"]);
+    }
+
+    #[test]
+    fn test_xargs_runs_command() {
+        let mut shell = Shell::new();
+        shell
+            .fs_mut()
+            .write_file("/f.txt", "/", b"line1\nline2\nline3\n");
+        // xargs passes stdin tokens as args to the command
+        // "echo '/f.txt' | xargs wc -l" → wc -l /f.txt
+        let result = shell.execute("echo '/f.txt' | xargs wc -l");
+        assert!(result.stdout.contains("3"));
+    }
+
+    #[test]
+    fn test_xargs_multiple_files() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/a.txt", "/", b"line1\nline2\n");
+        shell.fs_mut().write_file("/b.txt", "/", b"only\n");
+        let result = shell.execute("echo '/a.txt /b.txt' | xargs wc -l");
+        assert!(result.stdout.contains("2"));
+        assert!(result.stdout.contains("1"));
+        assert!(result.stdout.contains("3")); // total
+    }
+
+    #[test]
+    fn test_diff_different() {
+        let mut shell = Shell::new();
+        shell.fs_mut().write_file("/a.txt", "/", b"foo\nbar\nbaz\n");
+        shell.fs_mut().write_file("/b.txt", "/", b"foo\nqux\nbaz\n");
+        let result = shell.execute("diff /a.txt /b.txt");
+        assert!(result.stdout.contains("< bar"));
+        assert!(result.stdout.contains("> qux"));
+        assert_eq!(result.exit_code, 1);
+    }
+
+    #[test]
+    fn test_diff_missing_file() {
+        let mut shell = Shell::new();
+        let result = shell.execute("diff /nope.txt /also_nope.txt");
+        assert_eq!(result.exit_code, 2);
+    }
+
+    #[test]
+    fn test_man_ls() {
+        let mut shell = Shell::new();
+        let result = shell.execute("man ls");
+        assert!(result.stdout.contains("Usage:"));
+        assert!(result.stdout.contains("ls"));
+        assert!(result.stdout.contains("-l"));
+        assert!(result.stdout.contains("-a"));
+    }
+
+    #[test]
+    fn test_man_list_all() {
+        let mut shell = Shell::new();
+        let result = shell.execute("man");
+        assert!(result.stdout.contains("Available commands"));
+        assert!(result.stdout.contains("ls"));
+        assert!(result.stdout.contains("grep"));
+        assert!(result.stdout.contains("sed"));
+        assert!(result.stdout.contains("man"));
+    }
+
+    #[test]
+    fn test_man_unknown() {
+        let mut shell = Shell::new();
+        let result = shell.execute("man nonexistent");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("command not found"));
     }
 }
